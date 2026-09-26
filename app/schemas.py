@@ -1060,6 +1060,41 @@ class JointTrialResponse(BaseModel):
         return data
 
 
+class ConflictGroupFlightOut(BaseModel):
+    """A flight inside a conflict group, with its stable plan position."""
+
+    position: int
+    flight_no: str
+    scheduled_off: datetime
+    wake: Wake
+
+
+class ConflictGroupOut(BaseModel):
+    """One connected conflict component of a runway."""
+
+    flights: list[ConflictGroupFlightOut]
+    wake_count: int
+    capacity_count: int
+    closure_count: int
+
+
+class RunwayConflictGroupsOut(BaseModel):
+    runway: str
+    group_count: int
+    groups: list[ConflictGroupOut]
+
+
+class ConflictGroupsResponse(BaseModel):
+    """Read-only conflict grouping of a stored validate batch."""
+
+    batch_id: str
+    mode: str = "validate"
+    total_runways: int
+    total_groups: int
+    total_flights_in_groups: int
+    runways: list[RunwayConflictGroupsOut]
+
+
 class MatrixOut(BaseModel):
     matrix: dict[str, dict[str, int]]
 

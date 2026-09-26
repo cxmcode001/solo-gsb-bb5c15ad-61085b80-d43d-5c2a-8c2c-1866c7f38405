@@ -8,6 +8,7 @@ from .schemas import (
     WakeRequest,
     matrix_to_nested,
 )
+from .conflicts import ConflictGroup, build_conflict_groups
 from .joint import JointTrialResult, MutexGroup, joint_trial
 from .separation import (
     Capacity,
@@ -204,6 +205,23 @@ def run_best_adjacent_swap(req: WakeRequest) -> tuple[
 
 def nested_matrix(matrix: dict[tuple[str, str], int]) -> dict[str, dict[str, int]]:
     return matrix_to_nested(matrix)
+
+
+def run_conflict_groups(source: dict) -> dict[str, list[ConflictGroup]]:
+    """Per-runway connected conflict components of a stored validate batch.
+
+    ``source`` is the repository payload with the batch's flights and its
+    validate-time wake / closure / capacity conflict details.
+    """
+    return {
+        runway: build_conflict_groups(
+            flights,
+            source["violations"].get(runway, []),
+            source["closure_conflicts"].get(runway, []),
+            source["capacity_violations"].get(runway, []),
+        )
+        for runway, flights in source["flights"].items()
+    }
 
 
 class SlotBaselineError(Exception):

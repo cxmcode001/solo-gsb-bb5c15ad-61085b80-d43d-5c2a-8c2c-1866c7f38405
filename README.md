@@ -35,6 +35,13 @@
    `[earliest_off, latest_off]`（含两端、精确到整秒）内求**最早可行的 UTC 时刻**——
    需同时满足插入前后相邻尾流间隔、关闭窗口避让与插入后全序列的滚动容量；找不到时
    返回明确的无空档结果。该接口为**只读查询**，不改写计划、不产生批次。
+6. **离场冲突分组（conflict-groups，只读）**：针对**已保存的 validate 批次**，从既有
+   航班与违规明细构图——尾流违规连接前后机、容量超限把其触发窗口内的同跑道航班
+   连成一组、关闭窗口冲突将命中航班标为单点——对每条跑道求含冲突的**连通分量**
+   （交叠的容量窗口与尾流边经共享航班合并，互不关联的冲突不因计划顺序相邻而合并），
+   每组输出按 `(计划时刻, 航班号)` 排序的航班及所含尾流/容量/关闭冲突数量，组按
+   最早航班排序；未涉及冲突的航班不输出。批次不存在返回 `404`，非 validate 批次
+   返回 `422`。
 
 **兼容形状**：未在任何航班上传 `locked` 字段时，validate/trial/批次回查的响应与旧版本
 完全一致（不出现 `locked`、`locked_flights`、`blocked`、`total_locked` 字段）；显式传了
@@ -423,6 +430,31 @@ capacity 的跑道回显 `capacity` 及容量结论/试排明细，未配置的�
 **可行全局前缀**与 blocker 的 `required_times` 一并回查；仅当原请求显式携带 `locked`
 时，回查结果才含 `locked_flights` / `blocked` / `total_locked`。不存在的 ID 返回 `404`。
 
+### `GET /api/v1/batches/{batch_id}/conflict-groups` — 离场冲突分组（只读）
+
+针对**已保存的 validate 批次**，把需要联动处理的离场冲突整理成组。**只读接口**，
+不改写任何计划或批次；批次不存在返回 `404`，批次为其它模式（trial /
+best-adjacent-swap / joint_trial）返回 `422`。
+
+构图规则（基于批次中既有航班与违规明细，不重新校验）：
+
+- **尾流违规**：每条违规把前机与后机连成一条边；
+- **容量超限**：每条超限把其触发窗口 `[window_start, window_end)` 内的同跑道航班
+  连成一组；
+- **关闭窗口冲突**：命中航班标为**单点冲突**（自身即一个节点）。
+
+对每条跑道求含冲突的**连通分量**：交叠的容量窗口与尾流边经共享航班合并；
+互不关联的冲突**不会**仅因计划顺序相邻而合并。未涉及任何冲突的航班不输出。
+
+响应：
+
+- 批次级：`batch_id` / `mode`（`validate`）/ `total_runways` / `total_groups` /
+  `total_flights_in_groups`；
+- 跑道级：`runway` / `group_count` / `groups`（无冲突的跑道为空列表）；
+- 每组：`flights`（按 `(计划时刻, 航班号)` 排序，含 `position` / `flight_no` /
+  `scheduled_off` / `wake`）与所含 `wake_count` / `capacity_count` /
+  `closure_count`；组按**最早航班**排序。
+
 ### 间隔矩阵（可选字段 `matrix`）
 
 请求可携带 `matrix` 覆盖默认矩阵：
@@ -455,7 +487,8 @@ capacity 的跑道回显 `capacity` 及容量结论/试排明细，未配置的�
   互斥组引用不存在的跑道/组内跑道重复/同一跑道属于多个组/组少于 2 条跑道/
   组名重复/组间隔非正整数等），或 best-adjacent-swap 请求含任意 `locked=true`
   航班，或 slots/insert 请求中候选号与现有航班重复、候选最早时刻晚于最晚时刻、
-  时刻未精确到整秒、**现有计划本身违反尾流/关闭窗口/容量约束**，响应体含中文原因。
+  时刻未精确到整秒、**现有计划本身违反尾流/关闭窗口/容量约束**，或对非
+  validate 模式的批次请求 conflict-groups，响应体含中文原因。
 - `404`：批次 ID 不存在。
 
 ---
@@ -503,6 +536,9 @@ curl -s -X POST http://localhost:8000/api/v1/slots/insert \
 
 # 回查批次
 curl -s http://localhost:8000/api/v1/batches/<batch_id>
+
+# 离场冲突分组（只读；仅限 validate 批次）
+curl -s http://localhost:8000/api/v1/batches/<batch_id>/conflict-groups
 ```
 
 `sample.json` 已随仓库提供（36L 跑道含关闭窗口与「10 分钟内最多 3 架」滚动容量约束，
@@ -520,7 +556,7 @@ export WAKE_DB_PATH=./wake.db            # 可选，默认 /data/wake.db
 uvicorn app.main:app --reload --port 8000
 ```
 
-运行测试（含 149 个领域逻辑与 API 端到端用例，使用临时 SQLite 文件）：
+运行测试（含 165 个领域逻辑与 API 端到端用例，使用临时 SQLite 文件）：
 
 ```bash
 python3 -m pip install pytest httpx
@@ -531,14 +567,15 @@ python3 -m pytest -q
 
 ```
 app/
-  main.py         # FastAPI 路由（validate / trial / best-adjacent-swap / trial/joint / slots/insert / batches / 元信息）
+  main.py         # FastAPI 路由（validate / trial / best-adjacent-swap / trial/joint / slots/insert / batches / batches/{id}/conflict-groups / 元信息）
   schemas.py      # Pydantic 请求与响应模型、输入校验（含关闭窗口/容量/锁定/互斥组/候选插入合法性与兼容序列化）
-  service.py      # 请求 -> 领域对象 -> 模式计算（含插入查询的现有计划 422 预检）
+  service.py      # 请求 -> 领域对象 -> 模式计算（含插入查询的现有计划 422 预检与冲突分组编排）
+  conflicts.py    # 离场冲突分组：尾流边/容量窗口/关闭单点构图与连通分量（union-find）
   joint.py        # 联合试排：全局稳定顺序、尾流/关闭/容量/互斥组间隔不动点迭代、锁定阻塞与各约束所需时刻
   separation.py   # 核心领域逻辑：稳定排序、相邻违规、关闭冲突、滚动容量校验、避窗/容量级联试排、锁定航班可行性（blocker）、相邻交换枚举择优、候选插入空档搜索、默认矩阵
   timeutils.py    # 时区归一化（统一 UTC，整数秒运算）
   database.py     # SQLite 连接、建表与旧库迁移（含 batches.mode CHECK 重建、互斥组表与联合试排列）
-  repository.py   # 批次/航班/关闭窗口/容量/冲突/违规/试排/交换/联合试排（含互斥组与各约束所需时刻）的持久化与回查
+  repository.py   # 批次/航班/关闭窗口/容量/冲突/违规/试排/交换/联合试排（含互斥组与各约束所需时刻）的持久化与回查、冲突分组数据源读取
   config.py       # 环境变量配置
 tests/            # pytest 领域单测 + TestClient API 测试
 Dockerfile
