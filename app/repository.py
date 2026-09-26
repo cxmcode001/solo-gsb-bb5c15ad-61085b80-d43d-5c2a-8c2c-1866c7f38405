@@ -435,6 +435,111 @@ def _required_times_json(blocked: JointBlocker) -> str:
     )})
 
 
+def load_conflict_group_inputs(
+    conn: sqlite3.Connection, batch_id: str
+) -> dict | None:
+    """Flights and validate-mode conflict detail for conflict grouping.
+
+    Returns ``None`` when the batch does not exist; otherwise a dict with
+    the batch ``mode``/``created_at`` and per-runway domain lists (flights
+    in stable order, wake violations, closure conflicts, capacity
+    violations) as persisted for a validate batch.
+    """
+    row = conn.execute(
+        "SELECT mode, created_at FROM batches WHERE batch_id = ?",
+        (batch_id,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    flights_by_runway: dict[str, list[Flight]] = {}
+    for fr in conn.execute(
+        "SELECT runway, flight_no, scheduled_off, wake FROM flights"
+        " WHERE batch_id = ? ORDER BY runway, position",
+        (batch_id,),
+    ):
+        flights_by_runway.setdefault(fr["runway"], []).append(
+            Flight(
+                flight_no=fr["flight_no"],
+                scheduled_off=_dt(fr["scheduled_off"]),
+                wake=fr["wake"],
+                runway=fr["runway"],
+            )
+        )
+
+    violations_by_runway: dict[str, list[Violation]] = {}
+    for vr in conn.execute(
+        "SELECT * FROM violations WHERE batch_id = ?"
+        " ORDER BY runway, leader_position",
+        (batch_id,),
+    ):
+        violations_by_runway.setdefault(vr["runway"], []).append(
+            Violation(
+                leader_no=vr["leader_no"],
+                follower_no=vr["follower_no"],
+                leader_wake=vr["leader_wake"],
+                follower_wake=vr["follower_wake"],
+                leader_time=_dt(vr["leader_time"]),
+                follower_time=_dt(vr["follower_time"]),
+                required_seconds=vr["required_seconds"],
+                actual_seconds=vr["actual_seconds"],
+                shortfall_seconds=vr["shortfall_seconds"],
+                leader_position=vr["leader_position"],
+                follower_position=vr["follower_position"],
+            )
+        )
+
+    conflicts_by_runway: dict[str, list[ClosureConflict]] = {}
+    for cr in conn.execute(
+        "SELECT * FROM closure_conflicts WHERE batch_id = ?"
+        " ORDER BY runway, position",
+        (batch_id,),
+    ):
+        conflicts_by_runway.setdefault(cr["runway"], []).append(
+            ClosureConflict(
+                flight_no=cr["flight_no"],
+                wake=cr["wake"],
+                scheduled_off=_dt(cr["scheduled_off"]),
+                position=cr["position"],
+                window_index=cr["window_index"],
+                window_start=_dt(cr["window_start"]),
+                window_end=_dt(cr["window_end"]),
+            )
+        )
+
+    capacity_by_runway: dict[str, list[CapacityViolation]] = {}
+    for cr in conn.execute(
+        "SELECT * FROM capacity_violations WHERE batch_id = ?"
+        " ORDER BY runway, position",
+        (batch_id,),
+    ):
+        capacity_by_runway.setdefault(cr["runway"], []).append(
+            CapacityViolation(
+                flight_no=cr["flight_no"],
+                wake=cr["wake"],
+                scheduled_off=_dt(cr["scheduled_off"]),
+                position=cr["position"],
+                window_seconds=cr["window_seconds"],
+                max_departures=cr["max_departures"],
+                anchor_flight_no=cr["anchor_flight_no"],
+                anchor_position=cr["anchor_position"],
+                anchor_off=_dt(cr["window_start"]),
+                window_end=_dt(cr["window_end"]),
+                departures_in_window=cr["departures_in_window"],
+                earliest_compliant_off=_dt(cr["earliest_compliant_off"]),
+            )
+        )
+
+    return {
+        "mode": row["mode"],
+        "created_at": row["created_at"],
+        "flights_by_runway": flights_by_runway,
+        "violations_by_runway": violations_by_runway,
+        "closure_conflicts_by_runway": conflicts_by_runway,
+        "capacity_violations_by_runway": capacity_by_runway,
+    }
+
+
 def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
     """Reconstruct a stored batch in the same shape as the POST responses."""
     row = conn.execute(

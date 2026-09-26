@@ -364,6 +364,130 @@ def find_capacity_violations(
     return violations
 
 
+@dataclass(frozen=True, slots=True)
+class ConflictGroupFlight:
+    """A flight inside a departure-conflict group."""
+
+    position: int  # 1-based stable-order position on its runway
+    flight_no: str
+    wake: str
+    scheduled_off: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ConflictGroup:
+    """One connected component of a runway's departure conflicts.
+
+    ``flights`` is sorted by (scheduled time, flight number); the counts
+    say how many wake violations, capacity overflows and closure-window
+    hits the component contains.
+    """
+
+    flights: tuple[ConflictGroupFlight, ...]
+    wake_conflict_count: int
+    capacity_conflict_count: int
+    closure_conflict_count: int
+
+
+def build_conflict_groups(
+    flights: list[Flight],
+    violations: list[Violation],
+    closure_conflicts: list[ClosureConflict],
+    capacity_violations: list[CapacityViolation],
+) -> list[ConflictGroup]:
+    """Group one runway's departure conflicts into connected components.
+
+    The graph is built over the runway's flights: every wake violation
+    links its leader and follower, every capacity overflow links *all*
+    same-runway flights whose scheduled time falls inside its triggering
+    window ``[anchor_off, window_end)``, and every closure-window hit marks
+    its flight as a singleton conflict node. The connected components of
+    this graph are the conflict groups: overlapping capacity windows and
+    wake edges merge through the flights they share, while unrelated
+    conflicts never merge just because their flights sit next to each other
+    in the planned order. Flights untouched by any conflict are not
+    returned. Groups are sorted by their earliest flight (scheduled time,
+    then flight number); flights inside a group follow the same key.
+    """
+    ordered = sort_flights(flights)
+    by_no = {f.flight_no: f for f in ordered}
+    position_of = {f.flight_no: idx for idx, f in enumerate(ordered, start=1)}
+
+    parent: dict[str, str] = {}
+
+    def find(no: str) -> str:
+        root = no
+        while parent[root] != root:
+            root = parent[root]
+        while parent[no] != root:
+            parent[no], no = root, parent[no]
+        return root
+
+    def add(no: str) -> None:
+        parent.setdefault(no, no)
+
+    def union(a: str, b: str) -> None:
+        root_a, root_b = find(a), find(b)
+        if root_a != root_b:
+            parent[root_b] = root_a
+
+    for v in violations:
+        add(v.leader_no)
+        add(v.follower_no)
+        union(v.leader_no, v.follower_no)
+
+    for cv in capacity_violations:
+        start_t = to_epoch_seconds(cv.anchor_off)
+        end_t = to_epoch_seconds(cv.window_end)
+        members = [f.flight_no for f in ordered if start_t <= f.t < end_t]
+        if cv.flight_no not in members:
+            members.append(cv.flight_no)
+        for no in members:
+            add(no)
+            union(members[0], no)
+
+    for c in closure_conflicts:
+        add(c.flight_no)
+
+    components: dict[str, list[str]] = {}
+    for no in parent:
+        components.setdefault(find(no), []).append(no)
+
+    groups: list[ConflictGroup] = []
+    for member_nos in components.values():
+        member_set = set(member_nos)
+        group_flights = tuple(
+            ConflictGroupFlight(
+                position=position_of[no],
+                flight_no=no,
+                wake=by_no[no].wake,
+                scheduled_off=by_no[no].scheduled_off,
+            )
+            for no in sorted(member_nos, key=lambda n: by_no[n].sort_key())
+        )
+        groups.append(
+            ConflictGroup(
+                flights=group_flights,
+                wake_conflict_count=sum(
+                    1 for v in violations if v.leader_no in member_set
+                ),
+                capacity_conflict_count=sum(
+                    1 for cv in capacity_violations if cv.flight_no in member_set
+                ),
+                closure_conflict_count=sum(
+                    1 for c in closure_conflicts if c.flight_no in member_set
+                ),
+            )
+        )
+    groups.sort(
+        key=lambda g: (
+            to_epoch_seconds(g.flights[0].scheduled_off),
+            g.flights[0].flight_no,
+        )
+    )
+    return groups
+
+
 def _trial_on_order(
     ordered: list[Flight],
     matrix: dict[tuple[str, str], int],

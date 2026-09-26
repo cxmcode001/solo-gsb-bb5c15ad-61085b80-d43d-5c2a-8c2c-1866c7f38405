@@ -1060,6 +1060,44 @@ class JointTrialResponse(BaseModel):
         return data
 
 
+class ConflictGroupFlightOut(BaseModel):
+    """A flight inside one departure-conflict group."""
+
+    position: int = Field(..., description="航班在本跑道稳定排序中的位次（1 基）")
+    flight_no: str
+    wake: Wake
+    scheduled_off: datetime
+
+
+class ConflictGroupOut(BaseModel):
+    """One connected component of a runway's departure conflicts."""
+
+    group_index: int = Field(..., description="组在本跑道内的序号（1 基，按最早航班排序）")
+    flights: list[ConflictGroupFlightOut] = Field(
+        ..., description="组内航班，按 (计划时刻, 航班号) 排序"
+    )
+    wake_conflict_count: int = Field(..., description="组内尾流间隔违规数量")
+    capacity_conflict_count: int = Field(..., description="组内容量超限数量")
+    closure_conflict_count: int = Field(..., description="组内关闭窗口冲突数量")
+
+
+class RunwayConflictGroupsOut(BaseModel):
+    runway: str
+    group_count: int
+    groups: list[ConflictGroupOut]
+
+
+class ConflictGroupsResponse(BaseModel):
+    """Departure-conflict groups of a saved validate batch (read-only)."""
+
+    batch_id: str
+    mode: str = "validate"
+    created_at: datetime
+    total_runways: int
+    total_groups: int
+    runways: list[RunwayConflictGroupsOut]
+
+
 class MatrixOut(BaseModel):
     matrix: dict[str, dict[str, int]]
 

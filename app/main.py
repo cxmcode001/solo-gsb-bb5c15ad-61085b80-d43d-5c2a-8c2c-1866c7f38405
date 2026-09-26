@@ -9,12 +9,15 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from .database import get_db, init_db
-from .repository import load_batch, save_batch
+from .repository import load_batch, load_conflict_group_inputs, save_batch
 from .schemas import (
     BaselineMetricsOut,
     BatchResponse,
     BestAdjacentSwapResponse,
     ClosureWindowOut,
+    ConflictGroupFlightOut,
+    ConflictGroupOut,
+    ConflictGroupsResponse,
     HealthOut,
     JointBlockedOut,
     JointRequiredTimesOut,
@@ -28,6 +31,7 @@ from .schemas import (
     RequiredClosureOut,
     RequiredMutexGroupOut,
     RequiredWakeOut,
+    RunwayConflictGroupsOut,
     RunwayReportOut,
     RunwaySwapOut,
     RunwayTrialOut,
@@ -42,7 +46,7 @@ from .schemas import (
     WakeRequest,
     default_matrix_nested,
 )
-from .separation import ClosureWindow, delay_stats
+from .separation import ClosureWindow, build_conflict_groups, delay_stats
 from .service import (
     SlotBaselineError,
     nested_matrix,
@@ -82,8 +86,12 @@ app = FastAPI(
         "航班号）确定插入位次，求候选区间内最早可行的 UTC 时刻（同时满足"
         "插入前后相邻尾流间隔、关闭窗口与插入后全序列滚动容量），找不到时"
         "返回明确的无空档结果；该接口为只读查询，不改写计划或批次。"
+        "conflict-groups 为已保存的 validate 批次整理需要联动处理的离场"
+        "冲突：尾流违规连接前后机、容量超限把触发窗口内的同跑道航班连成"
+        "一组、关闭窗口冲突记为单点冲突，按跑道求含冲突的连通分量并分组"
+        "返回（只读；批次不存在返回 404，非 validate 批次返回 422）。"
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -108,6 +116,7 @@ def root() -> dict:
             "joint_trial": "POST /api/v1/trial/joint",
             "slot_insert": "POST /api/v1/slots/insert",
             "batch": "GET /api/v1/batches/{batch_id}",
+            "conflict_groups": "GET /api/v1/batches/{batch_id}/conflict-groups",
         },
     }
 
@@ -853,3 +862,74 @@ def get_batch(
     if data is None:
         raise HTTPException(status_code=404, detail=f"批次不存在: {batch_id}")
     return BatchResponse(**data)
+
+
+@app.get(
+    "/api/v1/batches/{batch_id}/conflict-groups",
+    response_model=ConflictGroupsResponse,
+    tags=["wake"],
+)
+def get_conflict_groups(
+    batch_id: str, db: sqlite3.Connection = Depends(get_db)
+) -> ConflictGroupsResponse:
+    """整理已保存 validate 批次中需要联动处理的离场冲突（只读，不改写数据）。
+
+    对每条跑道构图：尾流违规连接前后机；容量超限把其触发窗口
+    ``[window_start, window_end)`` 内的同跑道航班连成一组；关闭窗口冲突
+    将命中航班标为单点冲突。含冲突的连通分量即冲突组——交叠的容量窗口
+    与尾流边经共享航班合并，互不关联的冲突不会仅因计划顺序相邻而合并。
+    每组返回按 (计划时刻, 航班号) 排序的航班及所含尾流/容量/关闭冲突
+    数量，组按最早航班排序；未涉及冲突的航班不输出。
+    批次不存在返回 404，非 validate 批次返回 422。
+    """
+    data = load_conflict_group_inputs(db, batch_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail=f"批次不存在: {batch_id}")
+    if data["mode"] != "validate":
+        raise HTTPException(
+            status_code=422,
+            detail=f"仅 validate 批次支持冲突分组，当前批次模式: {data['mode']}",
+        )
+
+    runway_outs: list[RunwayConflictGroupsOut] = []
+    total_groups = 0
+    for runway, flights in data["flights_by_runway"].items():
+        groups = build_conflict_groups(
+            flights,
+            data["violations_by_runway"].get(runway, []),
+            data["closure_conflicts_by_runway"].get(runway, []),
+            data["capacity_violations_by_runway"].get(runway, []),
+        )
+        total_groups += len(groups)
+        runway_outs.append(
+            RunwayConflictGroupsOut(
+                runway=runway,
+                group_count=len(groups),
+                groups=[
+                    ConflictGroupOut(
+                        group_index=index,
+                        flights=[
+                            ConflictGroupFlightOut(
+                                position=f.position,
+                                flight_no=f.flight_no,
+                                wake=f.wake,
+                                scheduled_off=f.scheduled_off,
+                            )
+                            for f in group.flights
+                        ],
+                        wake_conflict_count=group.wake_conflict_count,
+                        capacity_conflict_count=group.capacity_conflict_count,
+                        closure_conflict_count=group.closure_conflict_count,
+                    )
+                    for index, group in enumerate(groups, start=1)
+                ],
+            )
+        )
+
+    return ConflictGroupsResponse(
+        batch_id=batch_id,
+        created_at=data["created_at"],
+        total_runways=len(runway_outs),
+        total_groups=total_groups,
+        runways=runway_outs,
+    )
